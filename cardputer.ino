@@ -96,8 +96,10 @@ void drawHeader(const char* status) {
 
 // Add a message to the circular(ish) buffer
 void addMessage(const char* sender, const char* body) {
+  Serial.printf("Adding message: sender='%s', body='%s'\n", sender, body);
   // If full, shift everything up
   if (messageCount >= MAX_HISTORY) {
+    Serial.println("Message buffer full, shifting messages up.");
     for (int i = 0; i < MAX_HISTORY - 1; i++) {
       messageBuffer[i] = messageBuffer[i+1];
     }
@@ -112,12 +114,14 @@ void addMessage(const char* sender, const char* body) {
   messageBuffer[messageCount].body[MAX_MSG_LEN - 1] = '\0';
   
   messageCount++;
+  Serial.printf("Message added. Total messages: %d\n", messageCount);
 }
 
 // Render the message history list
 void drawMessages() {
   if (isInputMode) return; // Don't redraw history over input UI
 
+  Serial.println("Drawing messages to display.");
   M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, SCREEN_WIDTH, SCREEN_HEIGHT - HEADER_HEIGHT, BLACK);
   M5Cardputer.Display.setTextColor(WHITE, BLACK);
   M5Cardputer.Display.setTextSize(1); // Standard readable size
@@ -129,7 +133,10 @@ void drawMessages() {
   // Let's draw the last N messages that fit.
   
   for (int i = 0; i < messageCount; i++) {
-    if (y >= SCREEN_HEIGHT) break;
+    if (y >= SCREEN_HEIGHT) {
+      Serial.println("Screen is full, stopping message draw.");
+      break;
+    }
     
     // Sender in Green
     M5Cardputer.Display.setTextColor(GREEN, BLACK);
@@ -186,14 +193,19 @@ void drawInputUI() {
 
 // Send a message
 bool sendMessage(String text) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("sendMessage failed: WiFi not connected.");
+    return false;
+  }
 
   drawHeader("Sending...");
+  Serial.println("Sending message: " + text);
   
   // Generate a TxnID based on time
   String txnId = String(millis());
   
   String url = String(HOMESERVER_URL) + "/_matrix/client/v3/rooms/" + String(ROOM_ID) + "/send/m.room.message/" + txnId;
+  Serial.println("Request URL: " + url);
   
   http.begin(secureClient, url);
   http.addHeader("Content-Type", "application/json");
@@ -207,16 +219,20 @@ bool sendMessage(String text) {
   
   String requestBody;
   serializeJson(doc, requestBody);
+  Serial.println("Request Body: " + requestBody);
   
   int httpResponseCode = http.PUT(requestBody);
   http.end();
   
+  Serial.println("Send Response Code: " + String(httpResponseCode));
   if (httpResponseCode == 200) {
     drawHeader("Sent!");
+    Serial.println("Message sent successfully.");
     delay(500);
     return true;
   } else {
     drawHeader("Send Fail");
+    Serial.println("Failed to send message.");
     delay(1000);
     return false;
   }
@@ -224,9 +240,13 @@ bool sendMessage(String text) {
 
 // Sync messages
 void syncMatrix() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("syncMatrix failed: WiFi not connected.");
+    return;
+  }
   
   drawHeader("Syncing...");
+  Serial.println("Starting Matrix sync...");
   
   String url = String(HOMESERVER_URL) + "/_matrix/client/v3/sync";
   url += "?timeout=0"; // Return immediately for this implementation to keep UI responsive
@@ -234,14 +254,16 @@ void syncMatrix() {
   // If we have a token, use it to get only new messages
   if (nextBatchToken.length() > 0) {
     url += "&since=" + nextBatchToken;
-  } 
-  // If it's the very first boot, we might want to limit the filter to avoid fetching 1000s of messages
-  // But for simplicity, we rely on the server default (usually last 10)
+    Serial.println("Syncing with since token: " + nextBatchToken);
+  } else {
+    Serial.println("Performing initial sync (no since token).");
+  }
   
   http.begin(secureClient, url);
   http.addHeader("Authorization", "Bearer " + String(ACCESS_TOKEN));
   
   int httpCode = http.GET();
+  Serial.println("Sync Response Code: " + String(httpCode));
   
   if (httpCode == 200) {
     // Stream result to ArduinoJson
@@ -268,10 +290,12 @@ void syncMatrix() {
       const char* nb = doc["next_batch"];
       if (nb) {
         nextBatchToken = String(nb);
+        Serial.println("New batch token received: " + nextBatchToken);
       }
       
       // 2. Process Events
       JsonArray events = doc["rooms"]["join"][ROOM_ID]["timeline"]["events"];
+      Serial.printf("Found %d events in timeline.\n", events.size());
       
       bool newMsg = false;
       for (JsonObject v : events) {
@@ -293,9 +317,11 @@ void syncMatrix() {
       }
       
       if (newMsg) {
+        Serial.println("New messages found, redrawing display.");
         drawHeader("New Msg");
         drawMessages();
       } else {
+        Serial.println("No new messages.");
         drawHeader("Connected");
       }
       
@@ -307,6 +333,7 @@ void syncMatrix() {
   } else {
     String err = "Http Err: " + String(httpCode);
     drawHeader(err.c_str());
+    Serial.println("HTTP GET failed with code: " + String(httpCode));
   }
   
   http.end();
@@ -321,6 +348,9 @@ void setup() {
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
   
+  Serial.begin(115200);
+  Serial.println("M5Stack Cardputer Matrix Pager Client");
+
   // Display Setup
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.fillScreen(BLACK);
@@ -328,15 +358,22 @@ void setup() {
   
   // Connect WiFi
   drawHeader("WiFi Connecting...");
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     M5Cardputer.Display.print(".");
+    Serial.print(".");
   }
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
   
   // Configure SSL
   // INSECURE: We skip root cert validation for memory/maintenance simplicity
   secureClient.setInsecure();
+  Serial.println("SSL certificate validation is insecurely skipped.");
   
   drawHeader("WiFi Connected");
   delay(1000);
@@ -364,6 +401,7 @@ void loop() {
         if (!isInputMode) {
           isInputMode = true;
           inputString = "";
+          Serial.println("Entering input mode.");
           drawInputUI();
         }
         
@@ -380,6 +418,7 @@ void loop() {
       
       if (status.enter) {
         if (isInputMode && inputString.length() > 0) {
+          Serial.println("Enter key pressed, sending message.");
           if (sendMessage(inputString)) {
             // Success
             isInputMode = false;
@@ -387,6 +426,7 @@ void loop() {
             M5Cardputer.Display.fillRect(0, SCREEN_HEIGHT - 40, SCREEN_WIDTH, 40, BLACK); // clear input area
             drawMessages(); // Redraw history
             // Trigger immediate sync to see our own message
+            Serial.println("Message sent, forcing sync.");
             syncMatrix();
           }
         }
@@ -399,6 +439,7 @@ void loop() {
       if (isInputMode) {
         isInputMode = false;
         inputString = "";
+        Serial.println("Exiting input mode.");
         M5Cardputer.Display.fillRect(0, SCREEN_HEIGHT - 40, SCREEN_WIDTH, 40, BLACK);
         drawMessages();
       }

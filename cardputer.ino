@@ -239,104 +239,173 @@ bool sendMessage(String text) {
 }
 
 // Sync messages
+String extractBatchToken(Stream &stream) {
+  if (stream.find("\"next_batch\"")) {
+    if (stream.find(":")) {
+      if (stream.find("\"")) {
+        String token = stream.readStringUntil('\"');
+        return token;
+      }
+    }
+  }
+  return "";
+}
+
+
 void syncMatrix() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("syncMatrix failed: WiFi not connected.");
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  // 1. Memory Safety Check
+  // If we are getting dangerously low on RAM, skip this sync to let WiFi buffers clear
+  if (ESP.getFreeHeap() < 40000) {
+    Serial.printf("Low RAM (%d), skipping sync.\n", ESP.getFreeHeap());
     return;
   }
-  
-  drawHeader("Syncing...");
-  Serial.println("Starting Matrix sync...");
-  
+
+  secureClient.stop(); // Ensure clean connection
+
+  bool isInitialSync = (nextBatchToken.length() == 0);
+
   String url = String(HOMESERVER_URL) + "/_matrix/client/v3/sync";
-  url += "?timeout=0"; // Return immediately for this implementation to keep UI responsive
+  url += "?timeout=0";
   
-  // If we have a token, use it to get only new messages
-  if (nextBatchToken.length() > 0) {
+  if (!isInitialSync) {
     url += "&since=" + nextBatchToken;
-    Serial.println("Syncing with since token: " + nextBatchToken);
   } else {
-    Serial.println("Performing initial sync (no since token).");
+    // Initial Sync: Filtered URL
+    Serial.println("Performing PHASE 1 sync...");
+    drawHeader("Init Sync...");
+    url += "&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A1%7D%7D%7D";
   }
   
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.begin(secureClient, url);
   http.addHeader("Authorization", "Bearer " + String(ACCESS_TOKEN));
   
   int httpCode = http.GET();
-  Serial.println("Sync Response Code: " + String(httpCode));
   
   if (httpCode == 200) {
-    // Stream result to ArduinoJson
-    // The response can be large, so we use a Filter to only keep what we need
-    // to save memory.
-    
-    // Filter Definition
-    StaticJsonDocument<200> filter;
-    filter["next_batch"] = true;
-    filter["rooms"]["join"][ROOM_ID]["timeline"]["events"][0]["type"] = true;
-    filter["rooms"]["join"][ROOM_ID]["timeline"]["events"][0]["sender"] = true;
-    filter["rooms"]["join"][ROOM_ID]["timeline"]["events"][0]["content"]["body"] = true;
-    filter["rooms"]["join"][ROOM_ID]["timeline"]["events"][0]["content"]["msgtype"] = true;
+    Stream *stream = http.getStreamPtr();
 
-    // Dynamic document for the response. 
-    // ESP32-S3 has enough RAM for a reasonable chunk, but be careful.
-    // 20KB should cover a standard sync with a few text messages.
-    DynamicJsonDocument doc(20000); 
-    
-    DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-    
-    if (!error) {
-      // 1. Update Batch Token
-      const char* nb = doc["next_batch"];
-      if (nb) {
-        nextBatchToken = String(nb);
-        Serial.println("New batch token received: " + nextBatchToken);
-      }
-      
-      // 2. Process Events
-      JsonArray events = doc["rooms"]["join"][ROOM_ID]["timeline"]["events"];
-      Serial.printf("Found %d events in timeline.\n", events.size());
-      
-      bool newMsg = false;
-      for (JsonObject v : events) {
-        const char* type = v["type"];
-        const char* msgtype = v["content"]["msgtype"];
-        
-        // Check if it is a text message
-        if (type && strcmp(type, "m.room.message") == 0 && 
-            msgtype && strcmp(msgtype, "m.text") == 0) {
-              
-            const char* sender = v["sender"];
-            const char* body = v["content"]["body"];
-            
-            if (sender && body) {
-              addMessage(sender, body);
-              newMsg = true;
-            }
-        }
-      }
-      
-      if (newMsg) {
-        Serial.println("New messages found, redrawing display.");
-        drawHeader("New Msg");
-        drawMessages();
+    if (isInitialSync) {
+      // PHASE 1: Manual Token (No Changes)
+      String foundToken = extractBatchToken(*stream);
+      if (foundToken.length() > 0) {
+        nextBatchToken = foundToken;
+        Serial.println("SUCCESS: Token initialized: " + nextBatchToken);
+        drawHeader("Init Done");
       } else {
-        Serial.println("No new messages.");
-        drawHeader("Connected");
+        Serial.println("FAILED: Token missing in Phase 1.");
       }
-      
     } else {
-      drawHeader("JSON Err");
-      Serial.print("Deserialize failed: ");
-      Serial.println(error.c_str());
+      // PHASE 2: BROADER JSON PARSING
+      // We widen the filter to ensure we don't accidentally ignore the room data.
+      
+      StaticJsonDocument<1024> filter; // Increased size for safety
+      filter["next_batch"] = true;
+      // BROAD FILTER: Keep all joined room data. 
+      // This fixes issues where the specific ROOM_ID key lookup fails inside the filter.
+      filter["rooms"]["join"] = true; 
+
+      DynamicJsonDocument doc(32000); // Max safe size for ESP32 without PSRAM
+      
+      DeserializationError error = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+      
+      if (!error) {
+        // Update Token
+        const char* nb = doc["next_batch"];
+        if (nb) nextBatchToken = String(nb);
+        
+        // Navigate safely to the events
+        // We check if the room exists before trying to read it
+        if (doc["rooms"]["join"].containsKey(ROOM_ID)) {
+          JsonArray events = doc["rooms"]["join"][ROOM_ID]["timeline"]["events"];
+          
+          if (!events.isNull() && events.size() > 0) {
+            Serial.printf("Received %d new events.\n", events.size());
+            bool newMsg = false;
+            
+            for (JsonObject v : events) {
+              const char* type = v["type"];
+              // Helper to check msgtype exists before strcmp
+              if (type && strcmp(type, "m.room.message") == 0) {
+                 const char* msgtype = v["content"]["msgtype"];
+                 if (msgtype && strcmp(msgtype, "m.text") == 0) {
+                    addMessage(v["sender"], v["content"]["body"]);
+                    newMsg = true;
+                 }
+              }
+            }
+            
+            if (newMsg) {
+              drawHeader("New Msg");
+              drawMessages();
+            }
+          }
+        } else {
+          // Debugging: If we get a 200 OK but no room data, print why.
+          // This usually happens on "empty" syncs (keep-alives), which is normal.
+          // Serial.println("Sync OK, but no data for this room.");
+        }
+      } else {
+        Serial.print("Phase 2 JSON Error: ");
+        Serial.println(error.c_str());
+        Serial.printf("Free Heap: %d\n", ESP.getFreeHeap());
+      }
     }
   } else {
-    String err = "Http Err: " + String(httpCode);
-    drawHeader(err.c_str());
-    Serial.println("HTTP GET failed with code: " + String(httpCode));
+    Serial.println("HTTP Error: " + String(httpCode));
+    // If our token is expired/bad (401/400), reset it to trigger Phase 1 again
+    if (httpCode == 400 || httpCode == 401 || httpCode == 404) {
+      nextBatchToken = "";
+    }
   }
   
   http.end();
+}
+// =============================================================
+// SETUP
+// =============================================================
+
+void setup() {
+  // Initialize Cardputer
+  auto cfg = M5.config();
+  M5Cardputer.begin(cfg, true);
+  
+  Serial.begin(115200);
+  Serial.println("M5Stack Cardputer Matrix Pager Client");
+
+  // Display Setup
+  M5Cardputer.Display.setRotation(1);
+  M5Cardputer.Display.fillScreen(BLACK);
+  M5Cardputer.Display.setTextSize(TEXT_SIZE);
+  
+  // Connect WiFi
+  drawHeader("WiFi Connecting...");
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    M5Cardputer.Display.print(".");
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Configure SSL
+  // INSECURE: We skip root cert validation for memory/maintenance simplicity
+  secureClient.setInsecure();
+  Serial.println("SSL certificate validation is insecurely skipped.");
+  
+  drawHeader("WiFi Connected");
+  delay(1000);
+  
+  // Initial Sync
+  drawHeader("Initial Sync...");
+  syncMatrix();
+  drawMessages();
 }
 
 // =============================================================
